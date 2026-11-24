@@ -63,17 +63,53 @@ class ArrivalReconcileService(BaseModuleService):
         batch_records = self._read_jsonl(batch_file)
         source_count = len(batch_records)
 
-        # 从暂存产品目录查找目标落地产物文件
+        # 从暂存产品目录查找目标落地产物文件。
+        # 只认可「批次编号完全相等」的暂存分区，同前缀批次（如 BATCH-01-A /
+        # BATCH-01-B）不得互相串账；同一批次多轮落地时只对账最新一轮分区，
+        # 避免把历史轮次的记录累加进本轮实到条数。通配命中的候选文件还要按
+        # 记录内实际批次身份二次过滤。
         staging_dir = self._data_dir("staging")
         staging_count = 0
         late_count = 0
-        for sf in staging_dir.glob(f"*{batch_code}*.jsonl"):
-            s_records = self._read_jsonl(sf)
-            staging_count = len(s_records)
+        staging_file_name = None
+        staging_partition = None
+
+        target_file = None
+        exact_entries = [
+            se for se in store.rows("staging_area") if se.get("批次编号") == batch_code
+        ]
+        if exact_entries:
+            latest_entry = max(exact_entries, key=lambda se: int(se.get("id", 0)))
+            staging_partition = latest_entry.get("落地路径")
+            candidate = staging_dir / f"{latest_entry.get('暂存编号')}.jsonl"
+            if candidate.exists():
+                target_file = candidate
+        else:
+            # 兼容没有台账行的旧产物：通配候选后按记录携带的实际批次身份二次过滤
+            candidates = []
+            for sf in staging_dir.glob(f"*{batch_code}*.jsonl"):
+                recs = self._read_jsonl(sf)
+                if any(
+                    r.get("batch_code") == batch_code or r.get("batch_key") == batch_code
+                    for r in recs
+                ):
+                    candidates.append(sf)
+            if candidates:
+                target_file = max(candidates, key=lambda p: p.stat().st_mtime)
+                staging_partition = f"/staging/{batch_code}/"
+
+        if target_file is not None:
+            s_records = self._read_jsonl(target_file)
+            # 只统计携带本批实际身份的记录，杜绝同前缀/同分区异批记录串入
+            exact_records = [
+                r for r in s_records
+                if r.get("batch_code") == batch_code or r.get("batch_key") == batch_code
+            ]
+            staging_count = len(exact_records)
+            staging_file_name = target_file.name
             # 计算迟到条数：目标端实际记录数少于源端基准
             if staging_count < expected:
                 late_count = expected - staging_count
-            break
 
         missing_count = max(0, expected - staging_count)
         is_balanced = expected == staging_count
@@ -101,6 +137,9 @@ class ArrivalReconcileService(BaseModuleService):
             "late": late_count,
             "missing": missing_count,
             "balanced": is_balanced,
+            "conclusion": final_entry["status"] if final_entry else ("已平账" if is_balanced else "存在差异"),
+            "staging_partition": staging_partition,
+            "staging_file": staging_file_name,
         }
 
         # 对账结果驱动时效监控指标更新
@@ -112,10 +151,11 @@ class ArrivalReconcileService(BaseModuleService):
             except Exception as e:
                 result["auto_sla_update"] = {"error": str(e)}
 
-        # 对账完成后记录传输血缘
+        # 对账完成后记录传输血缘：把对账入口的实际批次身份与对账结果整体传入，
+        # 血缘侧将来源与该对账结果写入同一条记录（原子配对），避免跨批次错配。
         try:
             tl_svc = self._safe_import("app.services.transfer_lineage", "TransferLineageService")()
-            lineage_result = tl_svc.record_lineage(batch_code, is_balanced)
+            lineage_result = tl_svc.record_lineage(batch_code, is_balanced, reconcile=result)
             result["auto_lineage"] = lineage_result
         except Exception as e:
             result["auto_lineage"] = {"error": str(e)}

@@ -28,7 +28,9 @@ class StagingAreaService(BaseModuleService):
         暂存分区是传输链路中数据暂存的关键环节：它从传输产物文件读取数据，
         计算字节量，写入落地路径下的暂存产物文件，并推进分区水位。
         """
-        staging_code = f"STAG-{batch_code}-{int(time.time())}"
+        # 序号保证同秒内多次落地（同一批次多轮/并发批次）不会重名覆盖或追加到同一文件
+        existing = len(store.rows(self.MODULE))
+        staging_code = f"STAG-{batch_code}-{int(time.time())}-{existing + 1}"
         landing_path = f"/staging/{batch_code}/"
         values = {
             "暂存编号": staging_code,

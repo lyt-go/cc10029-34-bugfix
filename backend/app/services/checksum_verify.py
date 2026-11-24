@@ -62,12 +62,35 @@ class ChecksumVerifyService(BaseModuleService):
         batch_file = self._data_dir("batches") / f"{batch_code}.jsonl"
         batch_records = self._read_jsonl(batch_file)
 
-        # 从暂存产品目录查找对应落地产物文件（目标端数据）
+        # 从暂存产品目录查找对应落地产物文件（目标端数据）。
+        # 必须按完整批次编号精确解析暂存分区，同前缀批次的分区不得串用；
+        # 优先用暂存台账定位，缺失台账时再用通配候选 + 记录内批次身份过滤。
         staging_dir = self._data_dir("staging")
         staging_records = []
-        for staging_file in staging_dir.glob(f"*{batch_code}*.jsonl"):
-            staging_records = self._read_jsonl(staging_file)
-            break
+        exact_entries = [
+            se for se in store.rows("staging_area") if se.get("批次编号") == batch_code
+        ]
+        target_staging = None
+        if exact_entries:
+            latest_entry = max(exact_entries, key=lambda se: int(se.get("id", 0)))
+            candidate = staging_dir / f"{latest_entry.get('暂存编号')}.jsonl"
+            if candidate.exists():
+                target_staging = candidate
+        else:
+            for staging_file in staging_dir.glob(f"*{batch_code}*.jsonl"):
+                recs = self._read_jsonl(staging_file)
+                if any(
+                    r.get("batch_code") == batch_code or r.get("batch_key") == batch_code
+                    for r in recs
+                ):
+                    target_staging = staging_file
+                    break
+        if target_staging is not None:
+            staging_records = [
+                r for r in self._read_jsonl(target_staging)
+                if r.get("batch_code") == batch_code
+                or r.get("batch_key") == batch_code
+            ]
 
         # 计算源端与目标端校验值
         source_checksum = self._compute_checksum(str(batch_records))

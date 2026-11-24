@@ -190,6 +190,7 @@ class BaseModuleService:
         for i in range(count):
             records.append({
                 "batch_key": batch_key,
+                "batch_code": batch_key,
                 "line_no": i + 1,
                 f"{field_prefix}_a": f"val_{i}_a",
                 f"{field_prefix}_b": f"val_{i}_b",
